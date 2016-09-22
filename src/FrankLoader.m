@@ -20,7 +20,20 @@
 #import "NSApplication+FrankAutomation.h"
 #endif
 
+
 BOOL frankLogEnabled = NO;
+
+static void * loadDylib(NSString *path)
+{
+    NSDictionary *environment = [[NSProcessInfo processInfo] environment];
+    NSString *simulatorRoot = [environment objectForKey:@"IPHONE_SIMULATOR_ROOT"];
+    if (simulatorRoot) {
+        path = [simulatorRoot stringByAppendingPathComponent:path];
+    }
+
+	NSLog(@"Attempting to open the library at '%@'", path);
+    return dlopen([path fileSystemRepresentation], RTLD_LOCAL | RTLD_LAZY );
+}
 
 @implementation FrankLoader
 
@@ -53,15 +66,7 @@ BOOL frankLogEnabled = NO;
     NSLog(@"Injecting Frank loader");
     
     NSAutoreleasePool *autoreleasePool = [[NSAutoreleasePool alloc] init];
-    NSString *appSupportLocation = @"/System/Library/PrivateFrameworks/AppSupport.framework/AppSupport";
-    
-    NSDictionary *environment = [[NSProcessInfo processInfo] environment];
-    NSString *simulatorRoot = [environment objectForKey:@"IPHONE_SIMULATOR_ROOT"];
-    if (simulatorRoot) {
-        appSupportLocation = [simulatorRoot stringByAppendingString:appSupportLocation];
-    }
-    
-    void *appSupportLibrary = dlopen([appSupportLocation fileSystemRepresentation], RTLD_LAZY);
+    void *appSupportLibrary = loadDylib(@"/System/Library/PrivateFrameworks/AppSupport.framework/AppSupport");
     
     if(!appSupportLibrary) {
          NSLog(@"Unable to dlopen AppSupport. Cannot automatically enable accessibility.");
@@ -85,27 +90,49 @@ BOOL frankLogEnabled = NO;
         NSLog(@"Unable to dlsym CPCopySharedResourcesPreferencesDomainForDomain. Cannot automatically enable accessibility.");
     }
 
-    NSString* accessibilitySettingsBundleLocation = @"/System/Library/PreferenceBundles/AccessibilitySettings.bundle/AccessibilitySettings";
+    void* accessibilitySettingsBundle = loadDylib(@"/System/Library/PreferenceBundles/AccessibilitySettings.bundle/AccessibilitySettings");
 
-    if (simulatorRoot) {
-        accessibilitySettingsBundleLocation = [simulatorRoot stringByAppendingString:accessibilitySettingsBundleLocation];
-    }
-
-    const char *accessibilitySettingsBundlePath = [accessibilitySettingsBundleLocation fileSystemRepresentation];
-    void* accessibilitySettingsBundle = dlopen(accessibilitySettingsBundlePath, RTLD_LAZY);
+	BOOL couldEnableAccessibility = NO;
 
     if (accessibilitySettingsBundle) {
         Class axSettingsPrefControllerClass = NSClassFromString(@"AccessibilitySettingsController");
         id axSettingPrefController = [[axSettingsPrefControllerClass alloc] init];
 
-        id initialAccessibilityInspectorSetting = [axSettingPrefController AXInspectorEnabled:nil];
-        [axSettingPrefController setAXInspectorEnabled:@(YES) specifier:nil];
+		if([axSettingPrefController respondsToSelector:@selector(AXInspectorEnabled:)])
+		{
+			id initialAccessibilityInspectorSetting = [axSettingPrefController AXInspectorEnabled:nil];
+			[axSettingPrefController setAXInspectorEnabled:@(YES) specifier:nil];
 
-        NSLog(@"Successfully enabled the AXInspector.");
+			NSLog(@"Successfully enabled the AXInspector using the setAXInspectorEnabled selector.");
+			couldEnableAccessibility = YES;
+		}
     }
     else {
         NSLog(@"Unable to dlopen AccessibilitySettings. Cannout automatically enable accessibility.");
     }
+
+	if(!couldEnableAccessibility)
+	{
+        NSLog(@"Could not enable accessibility using the legacy methods.");
+
+		// If we get to this point, the legacy method has not worked
+        void *handle = loadDylib(@"/usr/lib/libAccessibility.dylib");
+
+        if (!handle) {
+			NSLog(@"Unable to open libAccessibility. Cannout automatically enable accessibility.");
+        }
+
+        int (*_AXSAutomationEnabled)(void) = dlsym(handle, "_AXSAutomationEnabled");
+        void (*_AXSSetAutomationEnabled)(int) = dlsym(handle, "_AXSSetAutomationEnabled");
+
+        int initialValue = _AXSAutomationEnabled();
+        _AXSSetAutomationEnabled(YES);
+        atexit_b(^{
+            _AXSSetAutomationEnabled(initialValue);
+        });
+
+		NSLog(@"Enabled accessibility using libAccessibility.");
+	}
 
     [autoreleasePool drain];
     
